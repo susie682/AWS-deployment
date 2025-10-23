@@ -1,0 +1,677 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for a multi-tier architecture with Route53, CloudFront,
+  public and internal ALBs, Auto Scaling groups for web and app tiers, ElastiCache Redis cluster,
+  RDS MySQL (Multi-AZ), AWS Backup, CloudWatch Alarms, and SNS topic.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name used as prefix for resource naming.
+    Type: String
+    Default: multitierapp
+  VpcCIDR:
+    Description: CIDR block for the VPC.
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnet1CIDR:
+    Description: CIDR for public subnet 1 (AZ A).
+    Type: String
+    Default: 10.0.0.0/24
+  PublicSubnet2CIDR:
+    Description: CIDR for public subnet 2 (AZ B).
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateSubnet1CIDR:
+    Description: CIDR for private subnet 1 (AZ A, for Web/App).
+    Type: String
+    Default: 10.0.2.0/24
+  PrivateSubnet2CIDR:
+    Description: CIDR for private subnet 2 (AZ B, for Web/App).
+    Type: String
+    Default: 10.0.3.0/24
+  DBSubnet1CIDR:
+    Description: CIDR for database subnet 1 (AZ A, for RDS primary).
+    Type: String
+    Default: 10.0.4.0/24
+  DBSubnet2CIDR:
+    Description: CIDR for database subnet 2 (AZ B, for RDS standby).
+    Type: String
+    Default: 10.0.5.0/24
+  WebInstanceType:
+    Description: EC2 instance type for web tier.
+    Type: String
+    Default: t3.small
+  AppInstanceType:
+    Description: EC2 instance type for app tier.
+    Type: String
+    Default: t3.small
+  DBInstanceClass:
+    Description: RDS instance class.
+    Type: String
+    Default: db.t3.micro
+  DBInstanceName:
+    Description: Name of the RDS DB instance (also used for DBIdentifier).
+    Type: String
+    Default: mydatabase
+  MasterUsername:
+    Description: Master username for the RDS MySQL database.
+    Type: String
+    Default: dbadmin
+  MasterUserPassword:
+    Description: Master user password for the RDS database.
+    Type: String
+    NoEcho: true
+  NotificationEmail:
+    Description: Email address for SNS notifications (CloudWatch alarms).
+    Type: String
+    Default: ''
+  ACMCertificateArn:
+    Description: (Optional) ACM Certificate ARN for the CloudFront distribution custom domain.
+    Type: String
+    Default: ''
+  DomainName:
+    Description: (Optional) Domain name for Route53 and CloudFront (e.g., www.example.com).
+    Type: String
+    Default: ''
+  HostedZoneId:
+    Description: (Optional) Route53 HostedZoneId for the DomainName.
+    Type: String
+    Default: ''
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VPC"
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-IGW"
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet-A"
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet-B"
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet-A (App/Web)"
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet-B (App/Web)"
+  DBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DBSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-DBSubnet-A"
+  DBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DBSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-DBSubnet-B"
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicRouteTable"
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateRouteTable-A"
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateRouteTable-B"
+  # NAT gateway per AZ for outbound from private subnets
+  NatEIP1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT-EIP-A"
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT-Gateway-A"
+  NatEIP2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT-EIP-B"
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT-Gateway-B"
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTableA
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTableB
+  DBSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DBSubnet1
+      RouteTableId: !Ref PrivateRouteTableA
+  DBSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DBSubnet2
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # Security Groups
+  ALBPublicSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB security group
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicALB-SG"
+  ALBPublicSGIngressHTTP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBPublicSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: Allow HTTP from anywhere (CloudFront to ALB origin)
+  ALBInternalSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB security group (for App tier)
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-InternalALB-SG"
+  ALBInternalSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBInternalSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref WebServerSG
+      Description: Allow HTTP from Web servers to internal ALB
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Web EC2 instances
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServer-SG"
+  WebServerSGIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WebServerSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ALBPublicSG
+      Description: Allow HTTP from public ALB to Web servers
+  AppServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for App EC2 instances and Redis
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppServer-SG"
+  AppServerSGIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppServerSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ALBInternalSG
+      Description: Allow HTTP from internal ALB (Web tier) to App servers
+  AppServerSGIngressRedis:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppServerSG
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref AppServerSG
+      Description: Allow Redis communication within App SG (App servers and Redis)
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-DB-SG"
+  DBSGIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref AppServerSG
+      Description: Allow MySQL access from App servers
+
+  # Load Balancers and Target Groups
+  PublicALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Name: !Sub "${EnvironmentName}-Public-ALB"
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBPublicSG
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-Public-ALB"
+  PublicALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-Web-TG"
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200-399
+  InternalALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ALBInternalSG
+    Properties:
+      Name: !Sub "${EnvironmentName}-Internal-ALB"
+      Scheme: internal
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref ALBInternalSG
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-Internal-ALB"
+  InternalALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-App-TG"
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200-399
+
+  # Auto Scaling Groups and Launch Templates
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-WebServer-LT"
+      LaunchTemplateData:
+        InstanceType: !Ref WebInstanceType
+        # Use latest Amazon Linux 2 AMI via SSM parameter
+        ImageId: !Ref LatestAmiId
+        SecurityGroupIds:
+          - !Ref WebServerSG
+        UserData:
+          Fn::Base64: !Sub |
+                 #!/bin/bash -xe
+                  yum update -y
+                  amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+                  yum install -y httpd mod_proxy mod_proxy_http
+
+                  cat <<EOF > /etc/httpd/conf.d/static-proxy.conf
+                  ProxyPass "/static/" "http://${StaticBucket}.s3.${AWS::Region}.amazonaws.com/static/"
+                  ProxyPassReverse "/static/" "http://${StaticBucket}.s3.${AWS::Region}.amazonaws.com/static/"
+                  EOF
+
+                  echo "<h1>Web Server - AZ \$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</h1>" > /var/www/html/index.html
+                  echo "<a href='/static/sample.jpg'>Static File from S3</a>" >> /var/www/html/index.html
+
+                  systemctl enable httpd
+                  systemctl restart httpd
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-Web-ASG"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 2
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServer-ASG"
+          PropagateAtLaunch: true
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-AppServer-LT"
+      LaunchTemplateData:
+        InstanceType: !Ref AppInstanceType
+        ImageId: !Ref LatestAmiId
+        SecurityGroupIds:
+          - !Ref AppServerSG
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            DB_HOST="${RDSInstance.Endpoint.Address}"
+            DB_USER="${MasterUsername}"
+            DB_PASS="${MasterUserPassword}"
+            echo "Connecting to MySQL at $DB_HOST..."
+            mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -e "SELECT NOW();" > /var/www/html/db_test_result.txt 2>&1
+            echo "<h1>App Server (Tier 2) - AZ $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</h1>" > /var/www/html/index.html
+            echo "<pre>$(cat /var/www/html/db_test_result.txt)</pre>" >> /var/www/html/index.html
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-App-ASG"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 2
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppServer-ASG"
+          PropagateAtLaunch: true
+
+  # ElastiCache Redis (Multi-AZ replication group)
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for Redis cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub "${EnvironmentName}-RedisCluster"
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref AppServerSG
+
+  # RDS MySQL (Multi-AZ)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for RDS"
+      SubnetIds:
+        - !Ref DBSubnet1
+        - !Ref DBSubnet2
+      DBSubnetGroupName: !Sub "${EnvironmentName}-rds-subnet-group"
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DBSubnetGroup
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceName
+      Engine: mysql
+      EngineVersion: '8.0.42'
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      MultiAZ: true
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      PubliclyAccessible: false
+
+  # AWS Backup for RDS
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub "${EnvironmentName}-RDSBackupVault"
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${EnvironmentName}-RDSBackupPlan"
+        BackupPlanRule:
+          - RuleName: DailyRDSBackup
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 5 * * ? *)   # daily at 5 AM UTC
+            Lifecycle:
+              DeleteAfterDays: 30
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: RDSSelection
+        Resources:
+          - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DBInstanceName}"
+        IamRoleArn: arn:aws:iam::156865266376:role/LabRole
+
+  # S3 Bucket for Static Content
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-${AWS::AccountId}-static-assets"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-StaticContentBucket"
+
+  # CloudWatch Alarms and SNS
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: NotifyEmailProvided
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-AlarmTopic"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+  HighCPUWebAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "High CPU utilization in Web ASG"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Sub "${EnvironmentName}-Web-ASG"
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+  HighCPURDSAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "High CPU utilization on RDS instance"
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstanceName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Conditions:
+  UseCustomCert: !Not [ !Equals [ !Ref ACMCertificateArn, '' ] ]
+  UseCustomDomain: !Not [ !Equals [ !Ref DomainName, '' ] ]
+  NotifyEmailProvided: !Not [ !Equals [ !Ref NotificationEmail, '' ] ]
+
+Outputs:
+  PublicALBDNS:
+    Description: DNS name of the public Application Load Balancer
+    Value: !GetAtt PublicALB.DNSName
+  WebALBEndpoint:
+    Description: Public ALB URL (DNS name)
+    Value: !Sub "http://${PublicALB.DNSName}"
+  RDSPrimaryEndpoint:
+    Description: Primary MySQL DB endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  RDSPort:
+    Description: MySQL DB port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+  RedisPrimaryEndpoint:
+    Description: Primary Redis cluster endpoint
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
